@@ -8,7 +8,10 @@ use strict;
 use warnings;
 
 use Carp qw( croak );
-use MT::Util qw( relative_date offset_time epoch2ts ts2epoch format_ts );
+use MT::Util qw( relative_date offset_time epoch2ts ts2epoch format_ts encode_url );
+
+eval { require AnyEvent::HTTP; };
+my $HAS_ANY_EVENT = $@ ? 0 : 1;
 
 sub users_content_nav {
     my ($cb, $app, $param, $tmpl) = @_;
@@ -639,6 +642,8 @@ sub itemset_update_profiles {
 
     my %users;
     my $page_author_id;
+    my $cv;
+    $cv = AnyEvent->condvar if $HAS_ANY_EVENT;
     PROFILE: for my $profile ($app->param('id')) {
         my ($author_id, $type, $ident) = split /:/, $profile, 3;
 
@@ -653,11 +658,12 @@ sub itemset_update_profiles {
         my @profiles = grep { $_->{ident} eq $ident } @$profiles;
         for my $author_profile (@profiles) {
             update_events_for_profile($author, $author_profile,
-                synchronous => 1);
+                synchronous => 1, condvar => $cv, );
         }
 
         $page_author_id ||= $author_id;
     }
+    $cv->recv if $HAS_ANY_EVENT && $AnyEvent::HTTP::ACTIVE;
 
     return $app->redirect($app->uri(
         mode => 'other_profiles',
@@ -747,16 +753,19 @@ sub update_events {
     }, {
         join => [ $au_class->meta_pkg, 'author_id', { type => 'other_profiles' } ],
     });
+    my $cv;
+    $cv = AnyEvent->condvar if $HAS_ANY_EVENT;
     while (my $author = $author_iter->()) {
         my $profiles = $author->other_profiles();
         $mt->run_callbacks('pre_update_action_streams',  $mt, $author, $profiles);
 
         PROFILE: for my $profile (@$profiles) {
-            update_events_for_profile($author, $profile);
+            update_events_for_profile($author, $profile, condvar => $cv);
         }
 
         $mt->run_callbacks('post_update_action_streams', $mt, $author, $profiles);
     }
+    $cv->recv if $HAS_ANY_EVENT && $AnyEvent::HTTP::ACTIVE;
 
     $mt->run_callbacks('post_action_streams_task', $mt);
 }
@@ -799,7 +808,27 @@ sub update_events_for_profile {
     EVENTCLASS: for my $event_class (@event_classes) {
         next EVENTCLASS if !$streams->{$event_class->class_type};
 
-        if ($param{synchronous}) {
+        if ( my $cv = $param{condvar} ) {
+            my $stream = $event_class->registry_entry or return;
+            my $url = $stream->{url};
+            my $ident = $profile->{ident};
+            $ident = MT->VERSION >= 5 ? encode_url( $ident, 'utf-8' )
+                   :                    encode_url( encode_text( $ident, undef, 'utf-8'), 'utf-8' );
+            $url =~ s/ {{ident}} / $ident /xmsge;
+            next EVENTCLASS unless $url;
+            $cv->begin;
+            AnyEvent::HTTP::http_get( $url, sub {
+                my ( $content, $header ) = @_;
+                $event_class->update_events_loggily(
+                    author        => $author,
+                    hide_timeless => $param{hide_timeless} ? 1 : 0,
+                    content       => $content,
+                    %$profile,
+                );
+                $cv->end;
+            });
+        }
+        elsif ($param{synchronous}) {
             $event_class->update_events_loggily(
                 author        => $author,
                 hide_timeless => $param{hide_timeless} ? 1 : 0,

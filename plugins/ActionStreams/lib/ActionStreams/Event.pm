@@ -357,34 +357,37 @@ sub set_values {
 sub fetch_xpath {
     my $class = shift;
     my %params = @_;
+    my $content = $params{content};
+    unless ( $content ) {
+        my $url = $params{url} || '';
+        if (!$url) {
+            MT->log(
+                MT->component('ActionStreams')->translate(
+                    "No URL to fetch for [_1] results", $class));
+            return;
+        }
+        my $ua = $class->ua(%params);
+        my $res = $ua->get($url);
+        if (!$res->is_success()) {
+            MT->log(
+                MT->component('ActionStreams')->translate(
+                    "Could not fetch [_1]: [_2]", $url, $res->status_line()))
+                if $res->code != 304;
+            return;
+        }
+        # Do not continue if contents is incomplete.
+        if (my $abort = $res->{_headers}{'client-aborted'}) {
+            MT->log(
+                MT->component('ActionStreams')->translate(
+                    'Aborted fetching [_1]: [_2]', $url, $abort));
+            return;
+        }
 
-    my $url = $params{url} || '';
-    if (!$url) {
-        MT->log(
-            MT->component('ActionStreams')->translate(
-                "No URL to fetch for [_1] results", $class));
-        return;
-    }
-    my $ua = $class->ua(%params);
-    my $res = $ua->get($url);
-    if (!$res->is_success()) {
-        MT->log(
-            MT->component('ActionStreams')->translate(
-                "Could not fetch [_1]: [_2]", $url, $res->status_line()))
-            if $res->code != 304;
-        return;
-    }
-    # Do not continue if contents is incomplete.
-    if (my $abort = $res->{_headers}{'client-aborted'}) {
-        MT->log(
-            MT->component('ActionStreams')->translate(
-                'Aborted fetching [_1]: [_2]', $url, $abort));
-        return;
+        $content = $res->content;
     }
 
     # Strip leading whitespace, since the parser doesn't like it.
     # TODO: confirm we got xml?
-    my $content = $res->content;
     $content =~ s{ \A \s+ }{}xms;
 
     require XML::XPath;
@@ -512,11 +515,17 @@ sub save {
 sub fetch_scraper {
     my $class = shift;
     my %params = @_;
-    my ($url, $scraper) = @params{qw( url scraper )};
+    my ($url, $scraper, $content) = @params{qw( url scraper content)};
 
     $scraper->user_agent( $class->ua( %params, die_on_not_modified => 1 ) );
-    my $uri_obj = URI->new($url);
-    my $items = eval { $scraper->scrape($uri_obj) };
+    my $items;
+    if ( $content ) {
+        $items = eval { $scraper->scrape($content) };
+    }
+    else {
+        my $uri_obj = URI->new($url);
+        $items = eval { $scraper->scrape($uri_obj) };
+    }
 
     # Ignore Web::Scraper errors due to 304 Not Modified responses.
     if (!$items && $@ && !UNIVERSAL::isa($@, 'ActionStreams::UserAgent::NotModified')) {
